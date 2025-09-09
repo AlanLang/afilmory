@@ -1,0 +1,167 @@
+name: Deploy to Server
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+
+      - name: Cache pnpm modules
+        uses: actions/cache@v4
+        env:
+          cache-name: cache-pnpm-modules
+        with:
+          path: ~/.pnpm-store
+          key: ${{ runner.os }}-deploy-${{ env.cache-name }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-deploy-${{ env.cache-name }}-
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: true
+
+      - name: Configure Git for repository access
+        run: |
+          echo "Configuring Git for repository access..."
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          
+          # Setup SSH key for Git operations (reuse existing SSH_PRIVATE_KEY)
+          echo "Setting up SSH key for Git operations..."
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+          
+          echo "Git authentication configured successfully"
+
+      - name: Upload configuration files
+        run: |
+          echo "Uploading configuration files..."
+          
+          # Create .env file from secret
+          cat << 'ENV_EOF' > .env
+          ${{ secrets.ENV_FILE }}
+          ENV_EOF
+          
+          # Create builder.config.json from secret
+          cat << 'BUILDER_EOF' > builder.config.json
+          ${{ secrets.BUILDER_CONFIG }}
+          BUILDER_EOF
+          echo "Builder config file created ($(wc -c < builder.config.json) bytes)"
+          
+          # Create config.json from secret using heredoc
+          cat << 'CONFIG_EOF' > config.json
+          ${{ secrets.CONFIG_JSON }}
+          CONFIG_EOF
+          echo "Config file created ($(wc -c < config.json) bytes)"
+          
+          # Validate JSON files
+          echo "Validating JSON format..."
+          node -e "JSON.parse(require('fs').readFileSync('builder.config.json', 'utf8')); console.log('✓ builder.config.json is valid JSON')"
+          node -e "JSON.parse(require('fs').readFileSync('config.json', 'utf8')); console.log('✓ config.json is valid JSON')"
+          
+          echo "Configuration files uploaded successfully"
+
+      - name: Build project
+        run: |
+          echo "Building project..."
+          pnpm run build
+          echo "Build completed successfully"
+
+      - name: Prepare deployment package
+        run: |
+          echo "Preparing deployment package..."
+          
+          # Create deployment directory structure
+          mkdir -p deploy/afilmory/apps/ssr/.next
+          
+          # Copy standalone build files to root
+          cp -rf apps/ssr/.next/standalone/* deploy/afilmory/
+          
+          # Copy static files to .next directory
+          cp -rf apps/ssr/.next/static deploy/afilmory/apps/ssr/.next/
+          
+          # Copy public directory
+          cp -rf apps/ssr/public deploy/afilmory/apps/ssr/
+          
+          # Create compressed archive
+          tar -czf deployment.tar.gz -C deploy .
+          
+          echo "Deployment package created: deployment.tar.gz"
+          ls -la deployment.tar.gz
+
+      - name: Add server to known hosts
+        run: |
+          echo "Adding server to SSH known hosts..."
+          echo "Server: ${{ secrets.SERVER_HOST }}:${{ secrets.SERVER_PORT }}"
+          
+          # Scan SSH host keys with custom port
+          echo "Scanning SSH host keys..."
+          ssh-keyscan -H -p ${{ secrets.SERVER_PORT }} ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+          
+          echo "SSH host keys added successfully"
+          echo "Current known_hosts entries:"
+          cat ~/.ssh/known_hosts
+
+      - name: Deploy to server
+        run: |
+          echo "Deploying to server..."
+          
+          # Upload compressed file to server
+          rsync -avz --progress -e "ssh -p ${{ secrets.SERVER_PORT }}" deployment.tar.gz ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:${{ secrets.SERVER_PATH }}/
+          
+          # Execute deployment commands on remote server
+          ssh -p ${{ secrets.SERVER_PORT }} ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
+            set -e
+            cd ${{ secrets.SERVER_PATH }}
+            
+            echo "Backing up current deployment..."
+            if [ -d "afilmory" ]; then
+              mv afilmory backup-$(date +%Y%m%d-%H%M%S) || true
+            fi
+            
+            echo "Extracting new deployment..."
+            tar -xzf deployment.tar.gz
+            
+            echo "Setting permissions..."
+            chmod +x afilmory/ -R || true
+            
+            echo "Restarting services..."
+            sudo systemctl restart ${{ secrets.SERVICE_NAME }}
+            
+            echo "Checking service status..."
+            sudo systemctl status ${{ secrets.SERVICE_NAME }}
+            
+            echo "Deployment completed successfully!"
+          EOF
+
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "Cleaning up sensitive files..."
+          rm -f .env builder.config.json config.json
+          rm -f ~/.ssh/id_rsa
+          rm -f deployment.tar.gz
+          rm -rf deploy
